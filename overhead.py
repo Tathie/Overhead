@@ -84,7 +84,7 @@ def fmt_utc(epoch):
 def get_bytes(url):
     """Downloads whatever's at the URL and hands back the raw bytes. We send a User-Agent because some
     APIs get grumpy without one, and give up after 10 seconds so nothing hangs forever."""
-    req = Request(url, headers={"User-Agent": "Overhead/1.0"})
+    req = Request(url, headers={"User-Agent": "Overhead/1.1"})
     with urlopen(req, timeout=10) as r:
         return r.read()
 
