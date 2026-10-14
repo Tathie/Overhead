@@ -34,11 +34,13 @@ BG, CARD, BORDER = "#0b1118", "#121b25", "#1f2b38"
 TX, MUTED, ACCENT = "#e6edf5", "#7f90a3", "#6fa8dc"
 FIELD, BTN, BTN_HOVER = "#0e161e", "#16212c", "#1d2b39"
 
-route_cache, photo_cache, aircraft_cache = {}, {}, {}
+route_cache, photo_cache, aircraft_cache, wiki_cache = {}, {}, {}, {}
 
 
 def enable_dpi_awareness():
-    """Stops Windows from bitmap-stretching the window (the cause of blurry text)."""
+    """Tells Windows we can handle high-DPI screens ourselves, so it stops stretching the window like a
+    bitmap (that's what makes the text look blurry). Tries the newer API first, then the old one, and if
+    neither works we just shrug and carry on."""
     try:
         import ctypes
         try:
@@ -50,6 +52,8 @@ def enable_dpi_awareness():
 
 
 def load_config():
+    """Grabs the saved settings (basically just the window size). Checks the new config file first, then
+    the old one from back when this was called Flight Tracker. Nothing there? You get an empty dict."""
     for path in (CONFIG, OLD_CONFIG):
         try:
             with open(path) as f:
@@ -60,7 +64,9 @@ def load_config():
 
 
 def load_log():
-    """Returns (models, seen): per-model sighting counts, and when each aircraft was last in range."""
+    """Reads the sightings log off disk. You get back two things: how many times we've spotted each
+    model, and when each individual aircraft was last nearby. If the file's missing or busted, we just
+    start fresh with empty ones."""
     try:
         with open(LOG_PATH) as f:
             d = json.load(f)
@@ -70,20 +76,28 @@ def load_log():
 
 
 def fmt_utc(epoch):
-    """MM-DD-YYYY HH:MM (12-hour clock) in UTC. For a 24-hour clock change %I:%M %p to %H:%M."""
+    """Turns a Unix timestamp into something readable, like 10-14-2026 03:45 PM (in UTC).
+    Prefer a 24-hour clock? Just swap %I:%M %p for %H:%M."""
     return datetime.fromtimestamp(epoch, timezone.utc).strftime("%m-%d-%Y %I:%M %p")
 
 
 def get_bytes(url):
+    """Downloads whatever's at the URL and hands back the raw bytes. We send a User-Agent because some
+    APIs get grumpy without one, and give up after 10 seconds so nothing hangs forever."""
     req = Request(url, headers={"User-Agent": "Overhead/1.0"})
     with urlopen(req, timeout=10) as r:
         return r.read()
 
 
 def get_json(url):
+    """Same as get_bytes, but for APIs that talk JSON. Fetches it and turns it into Python stuff."""
     return json.loads(get_bytes(url).decode("utf-8"))
 
 
+# A little PowerShell script that asks Windows where we are. It keeps listening for up to 40 seconds and
+# prints a "lat,lon,accuracy" line every time the fix gets better. It bails early once we're within 50 m,
+# if things stop improving for 10 seconds, or if nothing shows up at all after 12 seconds.
+# (We squash it onto one line so it can be passed straight to powershell -Command.)
 LOCATION_SCRIPT = " ".join("""
 $ErrorActionPreference = 'SilentlyContinue';
 Add-Type -AssemblyName System.Device;
@@ -110,9 +124,11 @@ while (((Get-Date) - $start).TotalSeconds -lt 40) {
 
 
 def windows_location_stream(on_fix):
-    """Asks Windows Location Services (Wi-Fi positioning when an adapter is available) for a position.
-    Calls on_fix(lat, lon, accuracy_m) each time the fix improves, and stops once it is accurate
-    enough or has settled. Returns True if at least one fix arrived."""
+    """Asks Windows Location Services where we are (it'll use Wi-Fi positioning if there's an adapter).
+    Every time the position gets more accurate, we call on_fix(lat, lon, accuracy_m) so the app can
+    update right away instead of waiting for the perfect answer. Stops once it's accurate enough or
+    has settled down. Returns True if we got at least one position, False if Windows came up empty
+    (or we're not on Windows at all)."""
     if os.name != "nt":
         return False
     got, proc, watchdog = False, None, None
@@ -121,7 +137,7 @@ def windows_location_stream(on_fix):
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", LOCATION_SCRIPT],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
             text=True, creationflags=0x08000000)  # CREATE_NO_WINDOW: no console flash
-        watchdog = threading.Timer(60, proc.kill)
+        watchdog = threading.Timer(60, proc.kill)   # safety net: kill PowerShell if it ever gets stuck
         watchdog.start()
         for line in proc.stdout:
             try:
@@ -140,7 +156,66 @@ def windows_location_stream(on_fix):
     return got
 
 
+def wikipedia_page(model):
+    """Finds the Wikipedia article that best matches an aircraft model and returns (title, url), or None
+    if there just isn't one. First tries the full name (say "Boeing 737-800"), then the name without the
+    variant bit ("Boeing 737"). If every attempt failed because Wikipedia was unreachable, it raises
+    instead, so callers can tell "no page" apart from "no internet"."""
+    names = [model]
+    base = model.split("-")[0].strip()
+    if base and base != model:
+        names.append(base)
+    failures = 0
+    for name in names:
+        try:
+            j = get_json("https://en.wikipedia.org/w/api.php?action=opensearch&limit=1&format=json&search="
+                         + quote(name))
+            if j[1]:
+                return j[1][0], j[3][0]
+        except Exception:
+            failures += 1
+    if failures == len(names):
+        raise RuntimeError("Wikipedia unreachable")
+    return None
+
+
+def wikipedia_url(model):
+    """Gives you a Wikipedia link for a model no matter what. If we can find the actual article, great;
+    if not, you get a Wikipedia search page for it instead."""
+    try:
+        page = wikipedia_page(model)
+    except Exception:
+        page = None
+    return page[1] if page else "https://en.wikipedia.org/w/index.php?search=" + quote(model)
+
+
+def wikipedia_photo(model):
+    """Our backup photo: grabs the main picture from the model's Wikipedia article and returns
+    (PIL image, credit), or None if there's no page or no picture. Results get cached so we don't keep
+    asking Wikipedia about the same plane. Raises if Wikipedia can't be reached, so the caller knows to
+    try again later instead of giving up for good."""
+    if Image is None or not model or model == "—":
+        return None
+    if model in wiki_cache:
+        return wiki_cache[model]
+    result = None
+    page = wikipedia_page(model)
+    if page:
+        title = page[0]
+        j = get_json("https://en.wikipedia.org/api/rest_v1/page/summary/" + quote(title.replace(" ", "_"), safe=""))
+        src = (j.get("thumbnail") or {}).get("source")
+        if src:
+            try:
+                result = (fetch_image(src), f"Wikipedia · {title} (model photo)")
+            except Exception:
+                result = None
+    wiki_cache[model] = result
+    return result
+
+
 def dist_mi(lat1, lon1, lat2, lon2):
+    """How far apart two points are, in miles, as the crow flies. This is the haversine formula,
+    which accounts for the Earth being round (3958.8 is the Earth's radius in miles)."""
     p1, p2 = math.radians(lat1), math.radians(lat2)
     dl, dn = p2 - p1, math.radians(lon2 - lon1)
     a = math.sin(dl / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dn / 2) ** 2
@@ -148,6 +223,8 @@ def dist_mi(lat1, lon1, lat2, lon2):
 
 
 def direction(lat1, lon1, lat2, lon2):
+    """Which way you'd look to see point 2 from point 1, as a compass direction like "NE" or "W".
+    Works out the exact bearing in degrees, then snaps it to the nearest of the 8 compass points."""
     p1, p2, dn = math.radians(lat1), math.radians(lat2), math.radians(lon2 - lon1)
     y = math.sin(dn) * math.cos(p2)
     x = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dn)
@@ -156,6 +233,9 @@ def direction(lat1, lon1, lat2, lon2):
 
 
 def nearby(lat, lon):
+    """Asks the live ADS-B feeds for every aircraft around us. We ask for a slightly bigger circle than
+    we need and trim it down to the exact radius later. airplanes.live is the main source; if it's down,
+    adsb.fi steps in."""
     nm = math.ceil(RADIUS_MI / 1.15078) + 1   # feed radius is in nautical miles; add a little margin
     try:
         return get_json(f"https://api.airplanes.live/v2/point/{lat}/{lon}/{nm}").get("ac") or []
@@ -164,6 +244,9 @@ def nearby(lat, lon):
 
 
 def lookup_route(callsign):
+    """Figures out where a flight is coming from and going to, based on its callsign (like "UAL123").
+    Uses adsbdb and caches the answer, since a flight's route isn't going to change mid-air. Returns
+    None if there's no callsign or nobody knows the route."""
     if not callsign:
         return None
     if callsign not in route_cache:
@@ -176,7 +259,9 @@ def lookup_route(callsign):
 
 
 def lookup_aircraft(hex_id):
-    """Manufacturer / type details for this airframe (adsbdb)."""
+    """Looks up the details on this specific plane (manufacturer, type, registration, sometimes a photo)
+    using its hex ID from adsbdb. Good answers get cached; if the request fails we don't cache anything,
+    so it'll just try again on the next poll."""
     if hex_id not in aircraft_cache:
         try:
             resp = get_json(f"https://api.adsbdb.com/v0/aircraft/{hex_id}").get("response")
@@ -187,14 +272,18 @@ def lookup_aircraft(hex_id):
 
 
 def fetch_image(url):
+    """Downloads a picture and opens it with Pillow. We cap it at 1200x800 so giant photos don't eat
+    memory, but keep it big enough to look crisp once it's scaled down to fit the window."""
     img = Image.open(io.BytesIO(get_bytes(url))).convert("RGB")
     img.thumbnail((1200, 800))  # keep native detail; it's resized to fit the window later
     return img
 
 
-def lookup_photo(hex_id):
-    """Returns (PIL image, credit text) for this exact airframe, or None.
-    Uses the larger of the available sources so it stays sharp on high-res screens."""
+def lookup_photo(hex_id, model=None):
+    """Hunts down a photo of this exact plane and returns (PIL image, credit text), or None.
+    Planespotters goes first; if that's missing or kind of small, we also check airport-data.com and
+    keep whichever photo is bigger (so it still looks sharp on high-res screens). Still nothing? We fall
+    back to a generic shot of the model from Wikipedia."""
     if Image is None:
         return None
     if hex_id in photo_cache:
@@ -202,6 +291,7 @@ def lookup_photo(hex_id):
     best, errored = None, False
 
     def consider(url, credit):
+        """Downloads a candidate photo and keeps it if it beats the best one we've got so far."""
         nonlocal best
         img = fetch_image(url)
         if best is None or img.width > best[0].width:
@@ -224,12 +314,19 @@ def lookup_photo(hex_id):
                 consider(src, "Photo: airport-data.com")
         except Exception:
             errored = True
+    if best is None and model:  # no photo of this exact aircraft: fall back to its model's Wikipedia picture
+        try:
+            best = wikipedia_photo(model)
+        except Exception:
+            errored = True
     if best or not errored:  # don't permanently cache a network hiccup
         photo_cache[hex_id] = best
     return best
 
 
 def model_text(a, ac):
+    """Comes up with a nice name for the aircraft model. Prefers the feed's own description, then
+    manufacturer + type from adsbdb, then the short type code (like "B738"), and "—" if we've got nothing."""
     if a.get("desc"):
         return str(a["desc"]).title()
     if ac:
@@ -240,6 +337,8 @@ def model_text(a, ac):
 
 
 def altitude_text(alt):
+    """Makes the altitude readable: "On ground" if it's parked/taxiing, "12,345 ft" if it's flying,
+    or "—" if the feed didn't say."""
     if alt == "ground":
         return "On ground"
     if isinstance(alt, (int, float)):
@@ -248,19 +347,27 @@ def altitude_text(alt):
 
 
 def place(p):
+    """Turns an airport record into (code, city), like ("SEA", "Seattle"). Uses the familiar 3-letter
+    IATA code when there is one, otherwise the 4-letter ICAO code."""
     if not p:
         return "—", "Unknown"
     return p.get("iata_code") or p.get("icao_code") or "—", p.get("municipality") or p.get("name") or ""
 
 
 def label(parent, **kw):
+    """Little shortcut for making a Label that matches its parent's background and uses our normal
+    text color, so we don't have to spell that out every single time."""
     kw.setdefault("bg", parent["bg"])
     kw.setdefault("fg", TX)
     return tk.Label(parent, **kw)
 
 
 class App(tk.Tk):
+    """The whole app lives in here: the window, the two tabs, and all the polling."""
+
     def __init__(self):
+        """Sets everything up: figures out the screen scaling, restores the last window size, creates all
+        the state we track, builds the UI, and kicks off the timers (location, polling, the clock, etc.)."""
         super().__init__()
         cfg = load_config()
         self.s = self.winfo_fpixels("1i") / 96   # display scaling (e.g. 1.25 at 125%)
@@ -287,8 +394,9 @@ class App(tk.Tk):
         self.last_ok = None
         self.sel_hex, self.inrange, self.order = None, [], []   # which aircraft is shown / all in range / cycle order
         self.next_visible, self.again = False, False
-        self.flight_url = None
+        self.flight_url, self.cur_model = None, None
         self.tab, self._saved_at = "main", 0.0
+        self.sort_key, self.sort_desc = "last", True   # Log opens sorted by last sighted, most recent first
         self.log, self.seen = load_log()
         self.vars = {k: tk.StringVar(value="—") for k in
                      ("flight", "sub", "origin", "origin_city", "dest", "dest_city",
@@ -300,6 +408,7 @@ class App(tk.Tk):
         self.reset()
 
         self.bind("<Configure>", self.on_configure)
+        self.bind_all("<MouseWheel>", self._wheel)
         self.after(300, self.become_ready)
 
         self.after(100, self.dark_titlebar)
@@ -310,23 +419,35 @@ class App(tk.Tk):
 
     # ---------- sizing ----------
     def P(self, n):
+        """Converts a "design" pixel size into real pixels, taking both the display scaling and the
+        current zoom into account. Pretty much every size in the UI goes through this."""
         return int(n * self.s * self.zoom)
 
     def f(self, size, bold=False, underline=False):
+        """Makes a Segoe UI font that's scaled to the current zoom (but never smaller than 6pt so it
+        stays readable)."""
         font = tkfont.Font(family="Segoe UI", size=max(6, round(size * self.zoom)),
                            weight="bold" if bold else "normal", underline=underline)
         self._fonts.append(font)  # keep a reference so Tk doesn't discard it
         return font
 
     def zoom_for(self, width):
+        """Works out how zoomed-in everything should be for a given window width, kept between the
+        min and max zoom limits."""
         return round(min(ZOOM_MAX, max(ZOOM_MIN, width / self.base_w)), 2)
 
     def become_ready(self):
+        """Runs a moment after startup, once the window has actually appeared. From here on we start
+        reacting to resizes. If we didn't restore a saved size, we remember the starting height so we know
+        it's still ours to auto-adjust."""
         self.ready = True
         self.auto_h = None if self.saved else self.winfo_height()
         self.fit_height()
 
     def on_configure(self, e):
+        """Fires whenever the window moves or resizes. If the width changed enough to matter, we schedule a
+        rescale (waiting a beat so we're not rebuilding constantly mid-drag), and we also schedule saving
+        the new size."""
         if str(e.widget) != "." or not self.ready:
             return
         if abs(self.zoom_for(e.width) - self.zoom) >= 0.03:
@@ -338,6 +459,7 @@ class App(tk.Tk):
         self._save_job = self.after(600, self.save_config)
 
     def apply_resize(self):
+        """Once you've stopped dragging, recalculates the zoom and rebuilds the UI if it actually changed."""
         self._resize_job = None
         z = self.zoom_for(self.winfo_width())
         if z != self.zoom:
@@ -345,7 +467,8 @@ class App(tk.Tk):
             self.rebuild()
 
     def fit_height(self):
-        """Keep the window tall enough for its content, and shrink-wrap it unless you set the height yourself."""
+        """Makes sure the window's always tall enough to show everything. If you haven't dragged the
+        height yourself, it also shrink-wraps the window to fit the content snugly."""
         if not self.ready:
             return
         self.update_idletasks()
@@ -357,6 +480,8 @@ class App(tk.Tk):
             self.auto_h = need
 
     def rebuild(self):
+        """Tears down the whole UI and builds it again at the new zoom level. Easier than resizing every
+        widget one by one. Puts the photo back afterwards too."""
         for w in self.winfo_children():
             w.destroy()
         self._fonts = []
@@ -365,6 +490,8 @@ class App(tk.Tk):
         self.fit_height()
 
     def dark_titlebar(self):
+        """Switches the window's title bar to dark mode so it doesn't clash with the rest of the app.
+        Attribute 20 is the current Windows setting and 19 is the older one, so we just try both."""
         try:  # Windows 10/11 only; silently skipped elsewhere
             import ctypes
             hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
@@ -375,6 +502,8 @@ class App(tk.Tk):
 
     # ---------- UI ----------
     def build(self):
+        """Builds the entire UI from scratch: the tab headers up top, the main card with the flight info
+        and photo, the status box, and the Log page. Gets called again any time the zoom changes."""
         P, f = self.P, self.f
         W = P(430)
         inner = W - P(36)
@@ -413,16 +542,21 @@ class App(tk.Tk):
         top = tk.Frame(card, bg=CARD)
         top.pack(fill="x", pady=(P(10), 0), **pad)
         self.photo_box = tk.Frame(top, bg=CARD)
-        self.photo_box.pack(side="right", anchor="n", padx=(gap, 0))
         self.photo = label(self.photo_box)
         self.credit_lbl = label(self.photo_box, textvariable=self.credit, fg=MUTED, font=f(8),
                                 wraplength=photo_w, justify="left")
 
         info = tk.Frame(top, bg=CARD)
         info.pack(side="left", fill="both", expand=True, anchor="n")
-        flight_lbl = label(info, textvariable=self.vars["flight"], font=f(28, True), wraplength=inner, justify="left")
+        self.info, self.gap = info, gap
+        self.flight_font, self.flight_font_ul = f(28, True), f(28, True, underline=True)
+        flight_lbl = label(info, textvariable=self.vars["flight"], font=self.flight_font, wraplength=inner,
+                           justify="left", anchor="w")
         flight_lbl.pack(anchor="w")
         flight_lbl.bind("<Button-1>", self.open_flight)
+        flight_lbl.bind("<Enter>", lambda e: self.link_hover(True))
+        flight_lbl.bind("<Leave>", lambda e: self.link_hover(False))
+        self.flight_lbl = flight_lbl
         label(info, textvariable=self.vars["sub"], fg=MUTED, font=f(10), wraplength=left_w,
               justify="left").pack(anchor="w")
 
@@ -440,12 +574,19 @@ class App(tk.Tk):
               justify="left").grid(row=1, column=2, sticky="nw")
 
         # Details stacked below
+        self.model_font, self.model_font_ul = f(14, True), f(14, True, underline=True)
         for text, key in (("MODEL", "model"), ("SPEED", "speed"), ("ALTITUDE", "altitude"), ("DISTANCE", "distance")):
             row = tk.Frame(card, bg=CARD)
             row.pack(fill="x", pady=(P(6), 0), **pad)
             label(row, text=text, fg=MUTED, font=f(8)).pack(anchor="w")
-            label(row, textvariable=self.vars[key], font=f(14, True), wraplength=inner,
-                  justify="left").pack(anchor="w")
+            value = label(row, textvariable=self.vars[key], font=self.model_font if key == "model" else f(14, True),
+                          wraplength=inner, justify="left")
+            value.pack(anchor="w")
+            if key == "model":   # links to the model's Wikipedia page; underlined only on hover, like the flight number
+                self.model_lbl = value
+                value.bind("<Button-1>", lambda e: self.cur_model and self.open_wikipedia(self.cur_model))
+                value.bind("<Enter>", lambda e: self.model_hover(True))
+                value.bind("<Leave>", lambda e: self.model_hover(False))
 
         box = tk.Frame(self.page_main, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
         box.pack(fill="x", padx=P(14), pady=P(10), ipady=P(6))
@@ -464,12 +605,15 @@ class App(tk.Tk):
         self.refresh_log()
 
     def fit_photo(self, img):
-        """Resize with a high-quality filter to fit the card at the current zoom."""
+        """Shrinks (or grows) the photo to fit its spot on the card at the current zoom, keeping its shape
+        and using a high-quality filter so it doesn't look jaggy."""
         max_w, max_h = self.P(190), self.P(130)
         r = min(max_w / img.width, max_h / img.height)
         return img.resize((max(1, int(img.width * r)), max(1, int(img.height * r))), LANCZOS)
 
     def apply_photo(self):
+        """Puts the current photo (and its credit line) on the card. If Pillow isn't installed, shows a
+        hint about how to get photos instead. If there's nothing to show, hides the photo area entirely."""
         self.photo.pack_forget()
         self.credit_lbl.pack_forget()
         if self.cur_photo and Image is not None:
@@ -481,29 +625,43 @@ class App(tk.Tk):
         elif Image is None and self.has_plane:
             self.credit.set("Aircraft photos need Pillow:  pip install pillow")
             self.credit_lbl.pack(anchor="w")
+        # Only reserve the right-hand column while there is something in it. (An emptied frame keeps its
+        # old size, which squeezed the text beside it.)
+        has_photo_area = bool(self.cur_photo and Image is not None) or (Image is None and self.has_plane)
+        if has_photo_area:
+            self.photo_box.pack(side="right", anchor="n", padx=(self.gap, 0), before=self.info)
+        else:
+            self.photo_box.pack_forget()
 
     def show(self, flight, sub, origin=("—", ""), dest=("—", ""), model="—", speed="—",
              altitude="—", distance="—", photo=None, plane=False):
+        """The one place that fills in every field on the main card. Anything you don't pass in gets a
+        dash. Also updates the photo and makes sure the window's still tall enough."""
         v = self.vars
         v["flight"].set(flight); v["sub"].set(sub)
         v["origin"].set(origin[0]); v["origin_city"].set(origin[1])
         v["dest"].set(dest[0]); v["dest_city"].set(dest[1])
         v["model"].set(model); v["speed"].set(speed); v["altitude"].set(altitude); v["distance"].set(distance)
         self.cur_photo, self.has_plane = photo, plane
+        self.cur_model = model if model not in ("—", "") else None
         self.apply_photo()
         self.after_idle(self.fit_height)
 
     def reset(self):
-        """Default 'nothing in range' state: clears every field and the photo."""
+        """Back to the "nothing nearby" look: wipes every field and the photo, and turns off the links."""
         self.show("Watching the sky...", "")
         self.flight_url = None
+        self.link_hover(False)
+        self.model_hover(False)
 
     def mark_updated(self):
+        """Notes that we just got fresh data, which resets the "Last updated" counter back to zero."""
         self.last_ok = time.monotonic()
         self.updated.set("Last updated 0 seconds ago")
 
     def clock(self):
-        """Live 'last updated' counter, ticks once a second."""
+        """Keeps the "Last updated X ago" line ticking along. Runs once a second, forever. Switches to
+        minutes + seconds after the first minute."""
         if self.last_ok is not None:
             secs = int(time.monotonic() - self.last_ok)
             txt = f"{secs} second{'' if secs == 1 else 's'}" if secs < 60 else f"{secs // 60} min {secs % 60} s"
@@ -512,6 +670,8 @@ class App(tk.Tk):
 
     # ---------- location ----------
     def save_config(self):
+        """Saves the window size so it opens the same way next time. The "layout" number lets us ignore
+        sizes saved by older versions whose layout was different. If saving fails, no big deal."""
         data = {"layout": 3, "w": self.winfo_width(), "h": self.winfo_height()}
         try:
             with open(CONFIG, "w") as f:
@@ -520,16 +680,22 @@ class App(tk.Tk):
             pass
 
     def set_pos(self, lat, lon):
+        """Stores our new location and immediately checks the sky around it."""
         self.pos = (lat, lon)
         self.refresh()
 
     def range_text(self, n):
+        """The little status line, like "2 aircraft within 3 mi of you."."""
         return f"{n} aircraft within {RADIUS_MI} mi of you."
 
     def find_location(self):
+        """Figures out where you are, in the background so the window doesn't freeze. Tries Windows
+        Location Services first, and falls back to a rough guess from your IP address. Results get passed
+        back through the queue for drain() to pick up."""
         self.status.set("Getting your location…")
 
         def work():
+            """The actual location lookup, running on its own thread."""
             try:
                 if not windows_location_stream(lambda lat, lon, acc: self.q.put(("pos", lat, lon))):
                     # Windows couldn't provide a position: fall back to the IP address (approximate)
@@ -543,6 +709,8 @@ class App(tk.Tk):
 
     # ---------- cycling through aircraft ----------
     def set_next_visible(self, flag):
+        """Shows or hides the "Show next" link. No point showing it when there's only one plane around.
+        We also remember the choice so it survives a UI rebuild."""
         self.next_visible = flag
         if flag:
             self.next_lbl.pack(side="left", padx=(self.P(8), 0))
@@ -550,7 +718,8 @@ class App(tk.Tk):
             self.next_lbl.pack_forget()
 
     def show_next(self, _event=None):
-        """Advance to the next aircraft in range, looping back to the first after the last."""
+        """Jumps to the next aircraft in range, wrapping back around to the first one after the last.
+        Shows whatever we already know about it instantly, then kicks off a poll to fill in the rest."""
         if len(self.order) < 2:
             return
         idx = self.order.index(self.sel_hex) if self.sel_hex in self.order else -1
@@ -567,6 +736,7 @@ class App(tk.Tk):
             self.refresh()
 
     def show_tab(self, key):
+        """Switches between the main tab and the Log tab, and highlights whichever one's active."""
         self.tab = key
         (self.page_main if key == "main" else self.page_log).tkraise()
         for k, lbl in self.tab_lbls.items():
@@ -574,18 +744,21 @@ class App(tk.Tk):
             lbl.config(fg=ACCENT if on else MUTED)
             self.tab_bars[k].config(bg=ACCENT if on else BG)
 
+    def log_cols(self, frame):
+        """Sets up the Log's three column widths. The header and the rows both use this, so they always
+        line up with each other."""
+        P = self.P
+        frame.grid_columnconfigure(0, weight=1, minsize=P(130))
+        frame.grid_columnconfigure(1, minsize=P(75))
+        frame.grid_columnconfigure(2, minsize=P(180))
+
     def build_log_page(self):
+        """Builds the Log tab: a dark-themed scrollbar, clickable column headers for sorting, and a
+        scrollable list underneath (Tk doesn't have a scrollable frame, so it's a frame inside a canvas).
+        The rows themselves get filled in by refresh_log()."""
         P, f = self.P, self.f
-        font = lambda n, bold=False: ("Segoe UI", max(6, round(n * self.zoom))) + (("bold",) if bold else ())
         style = ttk.Style(self)
         style.theme_use("clam")
-        style.configure("Overhead.Treeview", background=CARD, fieldbackground=CARD, foreground=TX,
-                        borderwidth=0, rowheight=P(26), font=font(10))
-        style.layout("Overhead.Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
-        style.map("Overhead.Treeview", background=[("selected", CARD)], foreground=[("selected", TX)])
-        style.configure("Overhead.Treeview.Heading", background=BTN, foreground=MUTED, relief="flat",
-                        borderwidth=0, font=font(9, True))
-        style.map("Overhead.Treeview.Heading", background=[("active", BTN_HOVER)])
         style.configure("Overhead.Vertical.TScrollbar", background=BTN, troughcolor=CARD, bordercolor=CARD,
                         lightcolor=BTN, darkcolor=BTN, arrowcolor=MUTED)
 
@@ -593,33 +766,110 @@ class App(tk.Tk):
               font=f(8), wraplength=P(400), justify="left").pack(side="bottom", anchor="w", padx=P(18), pady=(P(4), P(6)))
         card = tk.Frame(self.page_log, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
         card.pack(fill="both", expand=True, padx=P(14), pady=P(4))
-        tree = ttk.Treeview(card, columns=("model", "count", "last"), show="headings",
-                            style="Overhead.Treeview", selectmode="none", height=12)
-        tree.heading("model", text="Model", anchor="w")
-        tree.heading("count", text="Sightings", anchor="center")
-        tree.heading("last", text="Last sighted (UTC)", anchor="w")
-        tree.column("model", width=P(150), minwidth=P(100), anchor="w", stretch=True)
-        tree.column("count", width=P(75), minwidth=P(60), anchor="center", stretch=False)
-        tree.column("last", width=P(160), minwidth=P(120), anchor="w", stretch=False)
-        bar = ttk.Scrollbar(card, orient="vertical", command=tree.yview, style="Overhead.Vertical.TScrollbar")
-        tree.configure(yscrollcommand=bar.set)
+        bar = ttk.Scrollbar(card, orient="vertical", style="Overhead.Vertical.TScrollbar")
         bar.pack(side="right", fill="y")
-        tree.pack(side="left", fill="both", expand=True)
-        self.tree = tree
+        body = tk.Frame(card, bg=CARD)
+        body.pack(side="left", fill="both", expand=True)
+
+        # Clickable column headings (click to sort, click again to reverse)
+        head = tk.Frame(body, bg=BTN)
+        head.pack(fill="x")
+        self.log_cols(head)
+        self.log_heads = {}
+        for i, (key, text, anchor) in enumerate((("model", "Model", "w"), ("count", "Sightings", "center"),
+                                                 ("last", "Last sighted (UTC)", "w"))):
+            h = tk.Label(head, text=text, bg=BTN, fg=MUTED, font=f(9, True), anchor=anchor,
+                         padx=P(10), pady=P(6), cursor="hand2")
+            h.grid(row=0, column=i, sticky="ew")
+            h.bind("<Button-1>", lambda e, k=key: self.sort_by(k))
+            h.bind("<Enter>", lambda e, w=h: w.config(bg=BTN_HOVER))
+            h.bind("<Leave>", lambda e, w=h: w.config(bg=BTN))
+            self.log_heads[key] = (h, text)
+
+        # Scrollable list of rows
+        canvas = tk.Canvas(body, bg=CARD, highlightthickness=0, bd=0, width=P(10), height=P(240),
+                           yscrollincrement=P(26))
+        canvas.pack(fill="both", expand=True)
+        inner = tk.Frame(canvas, bg=CARD)
+        win = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(win, width=e.width))
+        bar.configure(command=canvas.yview)
+        canvas.configure(yscrollcommand=bar.set)
+        self.log_cols(inner)
+        self.log_canvas, self.log_inner = canvas, inner
+        self.log_font, self.log_font_ul = f(10), f(10, underline=True)
         self.log_empty = label(card, text="No sightings logged yet.", fg=MUTED, font=f(10))
 
+    def sort_by(self, key):
+        """Handles a click on a Log column header. Click a new column to sort by it, click the same one
+        again to flip the order. Then jumps back to the top of the list."""
+        if key == self.sort_key:
+            self.sort_desc = not self.sort_desc       # same column again: reverse the order
+        else:                                         # new column: Model A-Z, Sightings most, Last sighted newest
+            self.sort_key, self.sort_desc = key, {"model": False, "count": True, "last": True}[key]
+        self.refresh_log()
+        self.log_canvas.yview_moveto(0)
+
+    def sorted_log(self):
+        """Hands back the log entries sorted by whichever column you picked. We sort newest-first before
+        that, so anything that ties (say, two models with 3 sightings) shows the most recent one on top."""
+        rows = sorted(self.log.values(), key=lambda e: e.get("last", 0), reverse=True)   # newest first breaks ties
+        primary = {"model": lambda e: str(e["model"]).lower(),
+                   "count": lambda e: e["count"],
+                   "last": lambda e: e.get("last", 0)}[self.sort_key]
+        rows.sort(key=primary, reverse=self.sort_desc)
+        return rows
+
     def refresh_log(self):
-        self.tree.delete(*self.tree.get_children())
-        rows = sorted(self.log.values(), key=lambda e: e.get("last", 0), reverse=True)
-        for e in rows:
-            self.tree.insert("", "end", values=(e["model"], e["count"], fmt_utc(e["last"])))
+        """Redraws the whole Log list from scratch: updates the sort arrows on the headers, then adds a
+        row per model (with the model name linking to Wikipedia). Shows a "nothing yet" message if
+        the log's empty."""
+        P = self.P
+        for key, (h, text) in self.log_heads.items():
+            on = key == self.sort_key
+            h.config(text=text + (("  ▼" if self.sort_desc else "  ▲") if on else ""), fg=ACCENT if on else MUTED)
+        for w in self.log_inner.winfo_children():
+            w.destroy()
+        rows = self.sorted_log()
         if rows:
             self.log_empty.place_forget()
         else:
             self.log_empty.place(relx=0.5, rely=0.45, anchor="center")
+        for i, e in enumerate(rows):
+            link = tk.Label(self.log_inner, text=e["model"], bg=CARD, fg=ACCENT, font=self.log_font, anchor="w",
+                            justify="left", wraplength=P(165), padx=P(10), pady=P(5), cursor="hand2")
+            link.grid(row=2 * i, column=0, sticky="ew")
+            link.bind("<Enter>", lambda ev, w=link: w.config(font=self.log_font_ul))
+            link.bind("<Leave>", lambda ev, w=link: w.config(font=self.log_font))
+            link.bind("<Button-1>", lambda ev, m=e["model"]: self.open_wikipedia(m))
+            tk.Label(self.log_inner, text=str(e["count"]), bg=CARD, fg=TX, font=self.log_font, anchor="center",
+                     padx=P(10), pady=P(5)).grid(row=2 * i, column=1, sticky="ew")
+            tk.Label(self.log_inner, text=fmt_utc(e["last"]), bg=CARD, fg=TX, font=self.log_font, anchor="w",
+                     padx=P(10), pady=P(5)).grid(row=2 * i, column=2, sticky="ew")
+            tk.Frame(self.log_inner, bg=BORDER, height=1).grid(row=2 * i + 1, column=0, columnspan=3, sticky="ew")
+
+    def open_wikipedia(self, model):
+        """Opens the model's Wikipedia page in your browser. Finding the right page takes a network call,
+        so we do it on a background thread to keep the window responsive."""
+        threading.Thread(target=lambda: webbrowser.open(wikipedia_url(model)), daemon=True).start()
+
+    def _wheel(self, e):
+        """Lets the mouse wheel scroll the Log list, but only when your pointer is actually over it.
+        We walk up from whatever widget is under the mouse to check if it's inside the list."""
+        if self.tab != "log":
+            return
+        w = self.winfo_containing(e.x_root, e.y_root)
+        while w is not None:
+            if w is self.log_canvas:
+                self.log_canvas.yview_scroll(int(-e.delta / 120) or (-1 if e.delta > 0 else 1), "units")
+                return
+            w = w.master
 
     def record_sightings(self, infos):
-        """Count a sighting the first time an aircraft is in range (again only after 24 hours away)."""
+        """Adds to the Log when a plane shows up. Each aircraft only counts once; it can count again only
+        if it's been gone for 24 hours. Also forgets planes we haven't seen in over a day, and saves to disk
+        when something new was added (or at least once a minute, to keep the "last seen" times current)."""
         now, added = time.time(), False
         for hex_id, key, model in infos:
             last = self.seen.get(hex_id)
@@ -636,6 +886,7 @@ class App(tk.Tk):
             self.save_log()
 
     def save_log(self):
+        """Writes the sightings log to disk. If it fails, we'll just get it next time."""
         self._saved_at = time.monotonic()
         try:
             with open(LOG_PATH, "w") as f:
@@ -643,12 +894,26 @@ class App(tk.Tk):
         except OSError:
             pass
 
+    def link_hover(self, on):
+        """Underlines the flight number while you hover over it, so it feels like a link. Only does it
+        when there's actually somewhere to go."""
+        if hasattr(self, "flight_lbl"):
+            self.flight_lbl.config(font=self.flight_font_ul if on and self.flight_url else self.flight_font)
+
+    def model_hover(self, on):
+        """Same idea as link_hover, but for the model name (which links to Wikipedia)."""
+        if hasattr(self, "model_lbl"):
+            self.model_lbl.config(font=self.model_font_ul if on and self.cur_model else self.model_font)
+
     def open_flight(self, _event=None):
-        """Open the displayed flight on FlightAware (does nothing when no aircraft is shown)."""
+        """Opens the current flight on FlightAware when you click the flight number. If there's no plane
+        showing, clicking does nothing."""
         if self.flight_url:
             webbrowser.open(self.flight_url)
 
     def finish_poll(self):
+        """Marks the current poll as done. If someone asked for another one while it was running (like
+        hitting "Show next"), fire that off now."""
         self.busy = False
         if self.again:
             self.again = False
@@ -656,15 +921,22 @@ class App(tk.Tk):
 
     # ---------- polling ----------
     def tick_loop(self):
+        """The heartbeat: checks the sky every POLL_MS (10 seconds), forever."""
         self.refresh()
         self.after(POLL_MS, self.tick_loop)
 
     def refresh(self):
+        """Starts a poll on a background thread, as long as we know where we are and one isn't already
+        running (no need to pile them up)."""
         if self.pos and not self.busy:
             self.busy = True
             threading.Thread(target=self.work, args=self.pos, daemon=True).start()
 
     def work(self, lat, lon):
+        """The actual poll, running on a background thread. Grabs nearby aircraft, keeps the ones within
+        range, picks which one to show, looks up its route, details and photo, and gathers model info
+        for the Log. Everything gets sent back through the queue, since only the main thread is allowed
+        to touch the UI."""
         try:
             found = []
             for a in nearby(lat, lon):
@@ -680,6 +952,7 @@ class App(tk.Tk):
             want = self.sel_hex
             d, a = next(((dd, aa) for dd, aa in found if aa["hex"] == want), found[0])
             cs = (a.get("flight") or "").strip()
+            ac_sel = lookup_aircraft(a["hex"])
             listing = [dict(a=x, d=dd, dir=direction(lat, lon, x["lat"], x["lon"])) for dd, x in found]
             infos = []  # (hex, model key, model name) for every aircraft in range, used by the Log tab
             for _dd, x in found:
@@ -688,12 +961,15 @@ class App(tk.Tk):
                 if name != "—":
                     infos.append((x["hex"], x.get("t") or (ac_x or {}).get("icao_type") or name, name))
             self.q.put(("ok", len(found), dict(
-                a=a, d=d, route=lookup_route(cs), ac=lookup_aircraft(a["hex"]), photo=lookup_photo(a["hex"]),
+                a=a, d=d, route=lookup_route(cs), ac=ac_sel, photo=lookup_photo(a["hex"], model_text(a, ac_sel)),
                 dir=direction(lat, lon, a["lat"], a["lon"])), listing, infos))
         except Exception as e:
             self.q.put(("err", f"Couldn't reach the flight data feed: {e}"))
 
     def drain(self):
+        """Checks the queue every 200 ms for messages from the background threads and acts on them:
+        "pos" is a new location, "locerr" means location failed (try again in 15 s), "err" means the
+        flight feed failed, "none" means the sky's empty, and "ok" means we've got a plane to show."""
         try:
             while True:
                 item = self.q.get_nowait()
@@ -730,6 +1006,9 @@ class App(tk.Tk):
         self.after(200, self.drain)
 
     def render(self, r):
+        """Takes everything we know about one aircraft and turns it into what you see on the card:
+        callsign, airline and registration, route, model, speed (mph and knots), altitude and distance.
+        Also sets up the FlightAware link, using the callsign if there is one, or the hex ID if not."""
         a, route, ac = r["a"], r["route"], r["ac"]
         cs = (a.get("flight") or "").strip() or a["hex"].upper()
         airline = ((route or {}).get("airline") or {}).get("name")
@@ -746,5 +1025,6 @@ class App(tk.Tk):
 
 
 if __name__ == "__main__":
+    # DPI awareness has to be switched on before the window exists, or it won't take
     enable_dpi_awareness()
     App().mainloop()
